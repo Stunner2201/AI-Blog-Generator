@@ -1,0 +1,438 @@
+
+import os
+import json
+import asyncio
+import aiohttp
+import numpy as np
+import gradio as gr
+import nest_asyncio
+import textstat
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from sentence_transformers import SentenceTransformer
+from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime
+import sys
+
+# Apply nest_asyncio for Colab compatibility
+nest_asyncio.apply()
+
+# Initialize environment
+os.environ["GROQ_API_KEY"] = "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"
+os.environ["NEWSDATA_API_KEY"] = "pub_715710d3e31d5c5ff53320972ef17b175eb74"
+
+# RAG Components
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+@dataclass
+class BlogMetadata:
+    title: str
+    slug: str
+    meta_description: str
+    tags: List[str]
+    reading_time: str
+    readability_score: float
+    word_count: int
+    generated_at: str
+
+class ResearchAgent:
+    def __init__(self):
+        self.session = None
+
+    async def initialize(self):
+        self.session = aiohttp.ClientSession()
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def fetch_news(self, topic: str) -> List[str]:
+        if not self.session:
+            await self.initialize()
+        url = f"https://newsdata.io/api/1/news?apikey={os.getenv('NEWSDATA_API_KEY')}&q={topic}&language=en"
+        async with self.session.get(url) as response:
+            if response.status != 200:
+                raise Exception(f"NewsData API Error: {response.status}")
+            data = await response.json()
+            return [f"{article.get('title', '')}\n{article.get('description', '')}"
+                   for article in data.get("results", [])[:5]]
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def duckduckgo_search(self, query: str) -> List[str]:
+        if not self.session:
+            await self.initialize()
+        ddg_url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&no_redirect=1"
+        async with self.session.get(ddg_url) as response:
+            if response.status == 200:
+                data = await response.json()
+                results = []
+                if data.get("AbstractText"):
+                    results.append(data["AbstractText"])
+                if data.get("RelatedTopics"):
+                    results.extend(topic["Text"] for topic in data["RelatedTopics"][:3] if topic.get("Text"))
+                return results
+            return []
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def get_datamuse_keywords(self, term: str) -> List[str]:
+        if not self.session:
+            await self.initialize()
+        url = f"https://api.datamuse.com/words?ml={term}&max=10&md=d"
+        async with self.session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                return [item["word"] for item in data if "word" in item]
+            return []
+
+    async def get_rag_context(self, topic: str, query: str) -> str:
+        """Enhanced RAG context retrieval"""
+        try:
+            news, ddg_results = await asyncio.gather(
+                self.fetch_news(topic),
+                self.duckduckgo_search(topic)
+            )
+
+            all_texts = news + ddg_results
+            if not all_texts:
+                return ""
+
+            query_embedding = model.encode(query)
+            doc_embeddings = model.encode(all_texts)
+            scores = np.dot(doc_embeddings, query_embedding)
+            top_idx = np.argmax(scores)
+            return all_texts[top_idx]
+        except Exception as e:
+            print(f"RAG context error: {str(e)}")
+            return ""
+
+class WritingAgent:
+    def __init__(self):
+        self.session = None
+
+    async def initialize(self):
+        self.session = aiohttp.ClientSession()
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def call_groq(self, prompt: str, system_message: str = None) -> str:
+        if not self.session:
+            await self.initialize()
+        try:
+            headers = {
+                "Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}",
+                "Content-Type": "application/json"
+            }
+            messages = [{"role": "system", "content": system_message}] if system_message else []
+            messages.append({"role": "user", "content": prompt})
+
+            payload = {
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 4000
+            }
+
+            async with self.session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"Groq API Error: {response.status} - {error_text}")
+                data = await response.json()
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"Groq API call failed: {str(e)}")
+            raise
+
+    async def generate_content(self, topic: str, tone: str) -> str:
+        """Generate comprehensive content with multiple sections"""
+        prompt = f"""Write a detailed, professional blog about '{topic}' in {tone} tone with this structure:
+
+# The Complete Guide to [Topic]
+
+[3-4 paragraph introduction explaining the importance and context of the topic. Include:
+- Current industry trends
+- Key challenges the technology addresses
+- Brief historical context
+- Why it matters now]
+
+## Why [Topic] is Transforming Industries
+
+[4-5 paragraphs discussing the significance across different sectors:
+- Healthcare applications with specific examples
+- Financial services use cases
+- Manufacturing implementations
+- Retail and e-commerce impacts
+Include real statistics and case studies]
+
+## Key Benefits and Advantages
+
+[Detailed section with 5-6 major benefits, each with:
+- Clear heading (### Benefit Name)
+- 2-3 paragraph explanation
+- Real-world implementation examples
+- Quantitative results where available]
+
+### [Benefit 1]
+[Explanation with examples]
+
+### [Benefit 2]
+[Explanation with examples]
+
+## Implementation Strategies
+
+[Practical guide with 4-5 key steps:
+1. Planning phase requirements
+2. Technology stack considerations
+3. Team composition needs
+4. Pilot project approach
+5. Scaling strategies]
+
+## Future Trends and Developments
+
+[3-4 paragraphs covering:
+- Emerging technologies in this space
+- Predicted market growth
+- New application areas
+- Potential disruptions]
+
+## Getting Started
+
+[Actionable advice with:
+- Learning resources
+- Tools to begin with
+- Community support options
+- Common pitfalls to avoid]
+
+## Summary
+
+[Concise 100-word summary highlighting:
+- Key takeaways
+- Main benefits
+- Implementation advice
+- Future outlook]
+
+---
+
+Requirements:
+- Minimum 2000 words total
+- Use proper Markdown headings (#, ##, ###)
+- Include at least 5 real-world examples
+- Reference at least 3 statistics
+- Maintain professional yet engaging tone
+- Provide concrete, actionable advice"""
+
+        content = await self.call_groq(prompt)
+        return content
+
+class SEOAgent:
+    async def generate_metadata(self, topic: str, content: str) -> BlogMetadata:
+        try:
+            word_count = len(content.split())
+
+            benefits = []
+            for line in content.split('\n'):
+                if line.startswith('### ') and len(benefits) < 3:
+                    benefits.append(line.replace('### ', '').strip())
+
+            return BlogMetadata(
+                title=f"The Complete Guide to {topic} - Benefits, Use Cases & Implementation",
+                slug=f"complete-guide-{topic.lower().replace(' ', '-')}-en",
+                meta_description=f"Comprehensive guide to {topic} covering benefits, real-world applications, implementation strategies and future trends. {content[:120]}..."[:160],
+                tags=[topic] + benefits + ['English'],
+                reading_time=f"{max(1, round(word_count / 200))} min",
+                readability_score=textstat.flesch_reading_ease(content),
+                word_count=word_count,
+                generated_at=datetime.now().isoformat()
+            )
+        except Exception as e:
+            print(f"SEO metadata error: {str(e)}")
+            return BlogMetadata("", "", "", [], "", 0, 0, "")
+
+class BlogWriter:
+    def __init__(self):
+        self.research = ResearchAgent()
+        self.writer = WritingAgent()
+        self.seo = SEOAgent()
+
+    async def initialize(self):
+        await self.research.initialize()
+        await self.writer.initialize()
+
+    async def generate_blog(self, topic: str, tone: str = "professional") -> Dict:
+        try:
+            await self.initialize()
+
+            content = await self.writer.generate_content(topic, tone)
+
+            keywords = await asyncio.gather(*[
+                self.research.get_datamuse_keywords(word)
+                for word in [topic, "benefits", "implementation", "use cases"]
+            ])
+            flattened_keywords = list(set([kw for sublist in keywords for kw in sublist if kw]))
+
+            metadata = await self.seo.generate_metadata(topic, content)
+
+            self._print_cli_summary(metadata)
+
+            return {
+                "content": content,
+                "metadata": metadata,
+                "word_count": len(content.split())
+            }
+
+        except Exception as e:
+            print(f"Blog generation error: {str(e)}")
+            return {"error": str(e)}
+        finally:
+            if self.research.session:
+                await self.research.session.close()
+            if self.writer.session:
+                await self.writer.session.close()
+
+    def _print_cli_summary(self, metadata: BlogMetadata):
+        """Print a summary of the generated blog to the console"""
+        print("\n" + "="*60)
+        print(" BLOG GENERATION SUMMARY ".center(60, "="))
+        print("="*60)
+        print(f"Title: {metadata.title}")
+        print(f"Language: English")
+        print(f"Word Count: {metadata.word_count}")
+        print(f"Reading Time: {metadata.reading_time}")
+        print(f"Readability Score: {metadata.readability_score:.1f} (100-90: Very Easy, 60-70: Standard)")
+        print(f"Top Tags: {', '.join(metadata.tags[:5])}")
+        print(f"Generated At: {metadata.generated_at}")
+        print("="*60 + "\n")
+
+def save_markdown(content: str, metadata: BlogMetadata) -> str:
+    """Save blog content as markdown file"""
+    try:
+        filename = f"{metadata.slug}.md"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return filename
+    except Exception as e:
+        print(f"Error saving markdown: {str(e)}")
+        return None
+
+def save_json(metadata: BlogMetadata) -> str:
+    """Save metadata as JSON file"""
+    try:
+        filename = f"metadata_{metadata.slug}.json"
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(metadata.__dict__, f, indent=2, ensure_ascii=False)
+        return filename
+    except Exception as e:
+        print(f"Error saving JSON: {str(e)}")
+        return None
+
+def run_blog_writer(topic: str, tone: str):
+    writer = BlogWriter()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(writer.generate_blog(topic, tone))
+        if "error" in result:
+            return f"❌ Error: {result['error']}", "{}", None, None
+        metadata = result["metadata"]
+        md_file = save_markdown(result["content"], metadata)
+        json_file = save_json(metadata)
+
+        # Return both file paths along with content and metadata
+        return (
+            result["content"],
+            json.dumps(metadata.__dict__, indent=2, ensure_ascii=False),
+            md_file,
+            json_file
+        )
+    except Exception as e:
+        return f"❌ System Error: {str(e)}", "{}", None, None
+    finally:
+        loop.close()
+
+with gr.Blocks(theme=gr.themes.Default(), css=".gradio-container {max-width: 900px !important}") as demo:
+    gr.Markdown("""
+    # 🚀  AI Blog Generator
+    Create comprehensive, professional-grade articles with proper structure and rich content
+    """)
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            topic_input = gr.Textbox(
+                label="Main Topic",
+                placeholder="e.g., Machine Learning, Data Analytics",
+                info="The primary subject of your article"
+            )
+            tone_input = gr.Dropdown(
+                label="Writing Tone",
+                choices=["professional", "technical", "educational", "conversational"],
+                value="professional",
+                info="Select the appropriate tone for your audience"
+            )
+            generate_btn = gr.Button("Generate Comprehensive Article", variant="primary")
+
+        with gr.Column(scale=2):
+            blog_output = gr.Markdown(
+                label="Generated Article",
+                elem_id="blog-output"
+            )
+            with gr.Accordion("SEO Metadata", open=False):
+                metadata_output = gr.Code(
+                    label="Technical Metadata",
+                    language="json",
+                    elem_id="metadata-output"
+                )
+            with gr.Row():
+                md_download = gr.File(
+                    label="💾 Download Markdown",
+                    visible=False,
+                    elem_id="md-download"
+                )
+                json_download = gr.File(
+                    label="📊 Download Metadata",
+                    visible=False,
+                    elem_id="json-download"
+                )
+
+    demo.css = """
+    #blog-output {
+        background-color: #f9f9f9;
+        padding: 20px;
+        border-radius: 8px;
+        border: 1px solid #e0e0e0;
+        color: #333;
+    }
+    #metadata-output {
+        max-height: 300px;
+        overflow-y: auto;
+    }
+    .dark #blog-output {
+        background-color: #1e1e1e;
+        color: #f0f0f0;
+    }
+    #md-download, #json-download {
+        margin: 10px 5px;
+    }
+    h1, h2, h3 {
+        margin-top: 1.2em !important;
+    }
+    """
+
+    def toggle_downloads(content, metadata):
+        has_content = content.strip() != "" and metadata.strip() not in ["{}", ""]
+        return (
+            gr.File.update(visible=has_content),
+            gr.File.update(visible=has_content)
+        )
+
+    generate_btn.click(
+        fn=run_blog_writer,
+        inputs=[topic_input, tone_input],
+        outputs=[blog_output, metadata_output, md_download, json_download]
+    ).then(
+        fn=toggle_downloads,
+        inputs=[blog_output, metadata_output],
+        outputs=[md_download, json_download]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
+

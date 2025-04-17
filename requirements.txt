@@ -1,0 +1,15 @@
+aiohttp==3.11.15
+python-dotenv==1.1.0
+textstat==0.7.5
+tenacity==9.1.2
+requests==2.32.3
+markdownify==1.1.0
+sentence-transformers==3.4.1
+faiss-cpu==1.10.0
+gradio==5.25.2
+nest_asyncio==1.6.0
+deep-translator==1.11.4
+numpy==2.0.2
+pandas==2.2.2
+pyphen==0.17.2
+cmudict==1.0.32
